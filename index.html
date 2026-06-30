@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Les Mains Oubliées — Prototype technique</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #000;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #fff;
+  }
+  canvas { display: block; position: fixed; top: 0; left: 0; }
+  .ui { position: fixed; pointer-events: none; z-index: 10; }
+  .ui-tl { top: 36px; left: 36px; max-width: 380px; }
+  .ui-tl h1 {
+    font-size: 13px; font-weight: 700; letter-spacing: 0.3em;
+    text-transform: uppercase; color: rgba(255, 255, 255, 0.9);
+    margin-bottom: 8px;
+  }
+  .ui-tl h1 .accent { color: #F57E1F; }
+  .ui-tl .sub {
+    font-size: 10px; color: rgba(255, 255, 255, 0.35);
+    letter-spacing: 0.18em; text-transform: uppercase;
+  }
+  .ui-tl .instr {
+    margin-top: 28px; font-size: 14px;
+    color: rgba(255, 255, 255, 0.65); line-height: 1.7;
+    font-style: italic; font-family: Georgia, "Times New Roman", serif;
+  }
+  .ui-bl { bottom: 36px; left: 36px; font-size: 9px;
+    letter-spacing: 0.25em; text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.25); }
+  .ui-br { bottom: 36px; right: 36px; font-size: 10px;
+    letter-spacing: 0.2em; text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.35); text-align: right; }
+  .ui-br .count {
+    font-family: Georgia, serif; font-size: 32px;
+    font-weight: 300; letter-spacing: 0;
+    color: rgba(255, 255, 255, 0.85);
+    text-transform: none; margin-top: 4px; font-style: italic;
+  }
+  #status {
+    position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 12px; letter-spacing: 0.3em;
+    text-transform: uppercase; color: rgba(255, 255, 255, 0.6);
+    transition: opacity 0.8s ease; z-index: 20; pointer-events: none;
+  }
+  #status.hidden { opacity: 0; }
+</style>
+</head>
+<body>
+
+<div class="ui ui-tl">
+  <h1>Les Mains <span class="accent">Oubliées</span></h1>
+  <div class="sub">Prototype · captation gestuelle temps réel</div>
+  <div class="instr">« Présente tes mains à l'écran.<br>Tes gestes deviennent maillage. »</div>
+</div>
+<div class="ui ui-bl">ESD · M2 Design Digital · 2026</div>
+<div class="ui ui-br">
+  Mains détectées
+  <div class="count" id="handCount">0</div>
+</div>
+<div id="status">Initialisation du modèle…</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+<script src="https://unpkg.com/ml5@1/dist/ml5.min.js"></script>
+<script>
+let video, handPose;
+let hands = [];
+let backgroundNoise = [];
+
+// Squelette anatomique standard
+const FINGER_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],
+  [13,17],[17,18],[18,19],[19,20],
+  [0,17]
+];
+
+// ==================================================================
+// PARAMÈTRES DE DENSITÉ DU MAILLAGE
+// ==================================================================
+const SKELETON_DENSITY = 6;      // points interpolés par segment du squelette
+const SATELLITES_PER_NODE = 4;   // satellites par point interpolé
+const MESH_THRESHOLD = 75;       // distance max pour connecter 2 points
+const KP_SATELLITES = 7;         // satellites supplémentaires autour des keypoints
+
+// Patterns de satellites pré-générés (stables, ne bougent pas avec le temps)
+const satellitePattern = [];
+function precomputeSatellites() {
+  for (let i = 0; i < 300; i++) {
+    const sats = [];
+    const count = i < 21 ? KP_SATELLITES : SATELLITES_PER_NODE;
+    for (let s = 0; s < count; s++) {
+      const angle = (s / count + Math.random() * 0.4) * Math.PI * 2;
+      const radius = 4 + Math.random() * 22;
+      sats.push({
+        dx: Math.cos(angle) * radius,
+        dy: Math.sin(angle) * radius,
+        alpha: 70 + Math.random() * 150,
+        size: 0.5 + Math.random() * 1.2
+      });
+    }
+    satellitePattern.push(sats);
+  }
+}
+
+function preload() {
+  handPose = ml5.handPose({ flipped: false });
+}
+
+function setup() {
+  const c = createCanvas(windowWidth, windowHeight);
+  c.parent(document.body);
+  precomputeSatellites();
+
+  video = createCapture(VIDEO, () => {
+    handPose.detectStart(video, gotHands);
+    const s = document.getElementById('status');
+    s.textContent = 'Présente tes mains';
+    setTimeout(() => s.classList.add('hidden'), 2000);
+  });
+  video.size(windowWidth, windowHeight);
+  video.hide();
+
+  for (let i = 0; i < 200; i++) {
+    backgroundNoise.push({
+      x: random(width), y: random(height),
+      size: random(0.4, 1.5),
+      alpha: random(15, 65),
+      drift: random(-0.08, 0.08)
+    });
+  }
+  background(0);
+}
+
+function gotHands(results) {
+  hands = results;
+  document.getElementById('handCount').textContent = String(results.length);
+}
+
+// ==================================================================
+// Génère tous les points qui composent le maillage d'une main
+// ==================================================================
+function generateHandPoints(kp) {
+  const points = [];
+  let patternIdx = 0;
+
+  // 1. Keypoints originaux + satellites autour
+  for (let i = 0; i < kp.length; i++) {
+    points.push({ x: kp[i].x, y: kp[i].y, type: 'kp' });
+    const sats = satellitePattern[i % satellitePattern.length];
+    for (const sat of sats) {
+      points.push({
+        x: kp[i].x + sat.dx,
+        y: kp[i].y + sat.dy,
+        type: 'sat',
+        alpha: sat.alpha,
+        size: sat.size
+      });
+    }
+  }
+
+  // 2. Points interpolés le long de chaque segment du squelette
+  // + satellites autour de chaque point interpolé
+  for (const [a, b] of FINGER_CONNECTIONS) {
+    const p1 = kp[a], p2 = kp[b];
+    if (!p1 || !p2) continue;
+
+    for (let s = 1; s < SKELETON_DENSITY; s++) {
+      const t = s / SKELETON_DENSITY;
+      const x = p1.x + (p2.x - p1.x) * t;
+      const y = p1.y + (p2.y - p1.y) * t;
+      points.push({ x, y, type: 'node' });
+
+      patternIdx++;
+      const sats = satellitePattern[(21 + patternIdx) % satellitePattern.length];
+      for (const sat of sats) {
+        points.push({
+          x: x + sat.dx,
+          y: y + sat.dy,
+          type: 'sat',
+          alpha: sat.alpha,
+          size: sat.size
+        });
+      }
+    }
+  }
+
+  return points;
+}
+
+function draw() {
+  // Effet de traînée subtile
+  noStroke();
+  fill(0, 0, 0, 38);
+  rect(0, 0, width, height);
+
+  // Bruit d'arrière-plan
+  for (const p of backgroundNoise) {
+    fill(255, 255, 255, p.alpha);
+    noStroke();
+    circle(p.x, p.y, p.size);
+    p.x += p.drift;
+    if (p.x < 0) p.x = width;
+    if (p.x > width) p.x = 0;
+  }
+
+  const sx = width / (video.width || windowWidth);
+  const sy = height / (video.height || windowHeight);
+
+  for (const hand of hands) {
+    const kp = hand.keypoints.map(k => ({
+      x: width - k.x * sx,
+      y: k.y * sy
+    }));
+
+    // Génère tous les points (~350 par main)
+    const points = generateHandPoints(kp);
+
+    // ============================================================
+    // 1. MAILLAGE DENSE — connecter toutes les paires proches
+    // ============================================================
+    const threshold2 = MESH_THRESHOLD * MESH_THRESHOLD;
+    for (let i = 0; i < points.length; i++) {
+      const p1 = points[i];
+      for (let j = i + 1; j < points.length; j++) {
+        const p2 = points[j];
+        const dx = p1.x - p2.x;
+        const dy = p1.y - p2.y;
+        const dist2 = dx * dx + dy * dy;
+        if (dist2 < threshold2) {
+          const dist = Math.sqrt(dist2);
+          // Opacité dégradée : très visible si proche, presque invisible si loin
+          const t = 1 - dist / MESH_THRESHOLD;
+          const alpha = t * t * 50 + 4;
+          stroke(255, 255, 255, alpha);
+          strokeWeight(0.25);
+          line(p1.x, p1.y, p2.x, p2.y);
+        }
+      }
+    }
+
+    // ============================================================
+    // 2. SQUELETTE PRINCIPAL — lignes plus marquées par-dessus
+    // ============================================================
+    stroke(255, 255, 255, 180);
+    strokeWeight(0.6);
+    for (const [a, b] of FINGER_CONNECTIONS) {
+      if (kp[a] && kp[b]) line(kp[a].x, kp[a].y, kp[b].x, kp[b].y);
+    }
+
+    // ============================================================
+    // 3. POINTS — tracer tous les vertices
+    // ============================================================
+    noStroke();
+    for (const p of points) {
+      if (p.type === 'kp') {
+        // Keypoint principal : plus visible
+        fill(255, 255, 255, 30);
+        circle(p.x, p.y, 8);
+        fill(255, 255, 255, 250);
+        circle(p.x, p.y, 2.2);
+      } else if (p.type === 'node') {
+        // Point interpolé sur le squelette
+        fill(255, 255, 255, 200);
+        circle(p.x, p.y, 1.4);
+      } else {
+        // Satellite
+        fill(255, 255, 255, p.alpha);
+        circle(p.x, p.y, p.size);
+      }
+    }
+  }
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  if (video) video.size(windowWidth, windowHeight);
+  backgroundNoise = [];
+  for (let i = 0; i < 200; i++) {
+    backgroundNoise.push({
+      x: random(width), y: random(height),
+      size: random(0.4, 1.5),
+      alpha: random(15, 65),
+      drift: random(-0.08, 0.08)
+    });
+  }
+}
+</script>
+</body>
+</html>
