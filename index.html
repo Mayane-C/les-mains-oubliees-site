@@ -73,6 +73,7 @@ let video, handPose;
 let hands = [];
 let backgroundNoise = [];
 
+// Squelette anatomique standard
 const FINGER_CONNECTIONS = [
   [0,1],[1,2],[2,3],[3,4],
   [0,5],[5,6],[6,7],[7,8],
@@ -83,18 +84,17 @@ const FINGER_CONNECTIONS = [
 ];
 
 // ==================================================================
-// PARAMÈTRES DE DENSITÉ — réduits pour la performance
+// PARAMÈTRES DE DENSITÉ DU MAILLAGE
 // ==================================================================
-const SKELETON_DENSITY = 4;      // 6 → 4
-const SATELLITES_PER_NODE = 2;   // 4 → 2
-const KP_SATELLITES = 4;         // 7 → 4
-const MESH_THRESHOLD = 70;
-const MESH_THRESHOLD_SQ = MESH_THRESHOLD * MESH_THRESHOLD;
-const CELL_SIZE = MESH_THRESHOLD;
+const SKELETON_DENSITY = 6;      // points interpolés par segment du squelette
+const SATELLITES_PER_NODE = 4;   // satellites par point interpolé
+const MESH_THRESHOLD = 75;       // distance max pour connecter 2 points
+const KP_SATELLITES = 7;         // satellites supplémentaires autour des keypoints
 
+// Patterns de satellites pré-générés (stables, ne bougent pas avec le temps)
 const satellitePattern = [];
 function precomputeSatellites() {
-  for (let i = 0; i < 200; i++) {
+  for (let i = 0; i < 300; i++) {
     const sats = [];
     const count = i < 21 ? KP_SATELLITES : SATELLITES_PER_NODE;
     for (let s = 0; s < count; s++) {
@@ -124,7 +124,7 @@ function setup() {
     handPose.detectStart(video, gotHands);
     const s = document.getElementById('status');
     s.textContent = 'Présente tes mains';
-    setTimeout(() => s.classList.add('hidden'), 1200);
+    setTimeout(() => s.classList.add('hidden'), 2000);
   });
   video.size(windowWidth, windowHeight);
   video.hide();
@@ -145,147 +145,134 @@ function gotHands(results) {
   document.getElementById('handCount').textContent = String(results.length);
 }
 
-// Buffer réutilisé pour éviter les allocations à chaque frame
-const pointsBuffer = [];
-
-function generateHandPoints(kp, out) {
-  out.length = 0;
+// ==================================================================
+// Génère tous les points qui composent le maillage d'une main
+// ==================================================================
+function generateHandPoints(kp) {
+  const points = [];
   let patternIdx = 0;
 
+  // 1. Keypoints originaux + satellites autour
   for (let i = 0; i < kp.length; i++) {
-    out.push({ x: kp[i].x, y: kp[i].y, type: 0 }); // 0 = kp
+    points.push({ x: kp[i].x, y: kp[i].y, type: 'kp' });
     const sats = satellitePattern[i % satellitePattern.length];
-    for (let s = 0; s < sats.length; s++) {
-      const sat = sats[s];
-      out.push({
+    for (const sat of sats) {
+      points.push({
         x: kp[i].x + sat.dx,
         y: kp[i].y + sat.dy,
-        type: 2, // 2 = sat
+        type: 'sat',
         alpha: sat.alpha,
         size: sat.size
       });
     }
   }
 
-  for (let c = 0; c < FINGER_CONNECTIONS.length; c++) {
-    const p1 = kp[FINGER_CONNECTIONS[c][0]];
-    const p2 = kp[FINGER_CONNECTIONS[c][1]];
+  // 2. Points interpolés le long de chaque segment du squelette
+  // + satellites autour de chaque point interpolé
+  for (const [a, b] of FINGER_CONNECTIONS) {
+    const p1 = kp[a], p2 = kp[b];
     if (!p1 || !p2) continue;
+
     for (let s = 1; s < SKELETON_DENSITY; s++) {
       const t = s / SKELETON_DENSITY;
       const x = p1.x + (p2.x - p1.x) * t;
       const y = p1.y + (p2.y - p1.y) * t;
-      out.push({ x, y, type: 1 }); // 1 = node
+      points.push({ x, y, type: 'node' });
+
       patternIdx++;
       const sats = satellitePattern[(21 + patternIdx) % satellitePattern.length];
-      for (let si = 0; si < sats.length; si++) {
-        const sat = sats[si];
-        out.push({
+      for (const sat of sats) {
+        points.push({
           x: x + sat.dx,
           y: y + sat.dy,
-          type: 2,
+          type: 'sat',
           alpha: sat.alpha,
           size: sat.size
         });
       }
     }
   }
-}
 
-// ==================================================================
-// Maillage par grille spatiale : O(N × ~20) au lieu de O(N²)
-// ==================================================================
-const gridBuckets = new Map();
-function drawMesh(points) {
-  gridBuckets.clear();
-  for (let i = 0; i < points.length; i++) {
-    const p = points[i];
-    const key = Math.floor(p.x / CELL_SIZE) * 100000 + Math.floor(p.y / CELL_SIZE);
-    let bucket = gridBuckets.get(key);
-    if (!bucket) { bucket = []; gridBuckets.set(key, bucket); }
-    bucket.push(i);
-  }
-
-  strokeWeight(0.25);
-  for (let i = 0; i < points.length; i++) {
-    const p1 = points[i];
-    const cx = Math.floor(p1.x / CELL_SIZE);
-    const cy = Math.floor(p1.y / CELL_SIZE);
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dy = -1; dy <= 1; dy++) {
-        const bucket = gridBuckets.get((cx + dx) * 100000 + (cy + dy));
-        if (!bucket) continue;
-        for (let b = 0; b < bucket.length; b++) {
-          const j = bucket[b];
-          if (j <= i) continue;
-          const p2 = points[j];
-          const ddx = p1.x - p2.x;
-          const ddy = p1.y - p2.y;
-          const d2 = ddx * ddx + ddy * ddy;
-          if (d2 < MESH_THRESHOLD_SQ) {
-            const dist = Math.sqrt(d2);
-            const t = 1 - dist / MESH_THRESHOLD;
-            const alpha = t * t * 50 + 4;
-            stroke(255, 255, 255, alpha);
-            line(p1.x, p1.y, p2.x, p2.y);
-          }
-        }
-      }
-    }
-  }
+  return points;
 }
 
 function draw() {
+  // Effet de traînée subtile
   noStroke();
   fill(0, 0, 0, 38);
   rect(0, 0, width, height);
 
-  for (let i = 0; i < backgroundNoise.length; i++) {
-    const p = backgroundNoise[i];
+  // Bruit d'arrière-plan
+  for (const p of backgroundNoise) {
     fill(255, 255, 255, p.alpha);
+    noStroke();
     circle(p.x, p.y, p.size);
     p.x += p.drift;
     if (p.x < 0) p.x = width;
-    else if (p.x > width) p.x = 0;
+    if (p.x > width) p.x = 0;
   }
-
-  if (!hands.length) return;
 
   const sx = width / (video.width || windowWidth);
   const sy = height / (video.height || windowHeight);
 
-  for (let h = 0; h < hands.length; h++) {
-    const rawKp = hands[h].keypoints;
-    const kp = new Array(rawKp.length);
-    for (let k = 0; k < rawKp.length; k++) {
-      kp[k] = { x: width - rawKp[k].x * sx, y: rawKp[k].y * sy };
+  for (const hand of hands) {
+    const kp = hand.keypoints.map(k => ({
+      x: width - k.x * sx,
+      y: k.y * sy
+    }));
+
+    // Génère tous les points (~350 par main)
+    const points = generateHandPoints(kp);
+
+    // ============================================================
+    // 1. MAILLAGE DENSE — connecter toutes les paires proches
+    // ============================================================
+    const threshold2 = MESH_THRESHOLD * MESH_THRESHOLD;
+    for (let i = 0; i < points.length; i++) {
+      const p1 = points[i];
+      for (let j = i + 1; j < points.length; j++) {
+        const p2 = points[j];
+        const dx = p1.x - p2.x;
+        const dy = p1.y - p2.y;
+        const dist2 = dx * dx + dy * dy;
+        if (dist2 < threshold2) {
+          const dist = Math.sqrt(dist2);
+          // Opacité dégradée : très visible si proche, presque invisible si loin
+          const t = 1 - dist / MESH_THRESHOLD;
+          const alpha = t * t * 50 + 4;
+          stroke(255, 255, 255, alpha);
+          strokeWeight(0.25);
+          line(p1.x, p1.y, p2.x, p2.y);
+        }
+      }
     }
 
-    generateHandPoints(kp, pointsBuffer);
-    drawMesh(pointsBuffer);
-
-    // Squelette principal par-dessus
+    // ============================================================
+    // 2. SQUELETTE PRINCIPAL — lignes plus marquées par-dessus
+    // ============================================================
     stroke(255, 255, 255, 180);
     strokeWeight(0.6);
-    for (let c = 0; c < FINGER_CONNECTIONS.length; c++) {
-      const a = FINGER_CONNECTIONS[c][0];
-      const b = FINGER_CONNECTIONS[c][1];
+    for (const [a, b] of FINGER_CONNECTIONS) {
       if (kp[a] && kp[b]) line(kp[a].x, kp[a].y, kp[b].x, kp[b].y);
     }
 
-    // Points
+    // ============================================================
+    // 3. POINTS — tracer tous les vertices
+    // ============================================================
     noStroke();
-    for (let i = 0; i < pointsBuffer.length; i++) {
-      const p = pointsBuffer[i];
-      if (p.type === 0) {
+    for (const p of points) {
+      if (p.type === 'kp') {
+        // Keypoint principal : plus visible
         fill(255, 255, 255, 30);
         circle(p.x, p.y, 8);
         fill(255, 255, 255, 250);
         circle(p.x, p.y, 2.2);
-      } else if (p.type === 1) {
+      } else if (p.type === 'node') {
+        // Point interpolé sur le squelette
         fill(255, 255, 255, 200);
         circle(p.x, p.y, 1.4);
       } else {
+        // Satellite
         fill(255, 255, 255, p.alpha);
         circle(p.x, p.y, p.size);
       }
